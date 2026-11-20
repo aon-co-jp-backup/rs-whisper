@@ -12,3 +12,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "rs-whisper-mel"
 path = "src/bin/mel.rs"
+
+[[bin]]
+name = "rs-whisper-model"
+path = "src/bin/model.rs"
