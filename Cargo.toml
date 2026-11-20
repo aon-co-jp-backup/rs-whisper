@@ -1,0 +1,14 @@
+[package]
+name = "rs-whisper"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust port of whisper.cpp, built step by step (stage 1: log-mel spectrogram)"
+repository = "https://github.com/aon-co-jp/rs-whisper"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rs-whisper-mel"
+path = "src/bin/mel.rs"
