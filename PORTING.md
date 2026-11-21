@@ -1,32 +1,167 @@
-# rs-whisper 移植計画 / Porting plan (2026-11-20)
+# PORTING.md — rs-whisper 移植の記録 / Porting log
 
-## 試験のしかた / How to verify
-WSL(Ubuntu-24.04)で `bash tests/ref/run.sh <jfk.wav>`。元の関数を取り出した `tests/ref/ref.cpp`(g++ -O2)と Rust 版に同じ入力・同じフィルタを渡し、出力を `cmp.py` で比較する。2026-11-20: values=328000 exact=328000 max_abs_diff=0。
-注意: 一致は glibc の sinf/cosf を使う環境(Linux)での結果。メルフィルタは、合成値と、実モデル形式のファイルから読んだ値の両方で一致を確認済み。
+元: [whisper.cpp](https://github.com/ggml-org/whisper.cpp)(MIT)。方針は [`POLICY.md`](POLICY.md)、AI 向けの決まりは [`CLAUDE.md`](CLAUDE.md)。 全12言語・AI翻訳(ネイティブ検証前)。
 
-## whisper.cpp の規模(取得時点 fc89e85)
-`src/` 約1.6万行(うち `whisper.cpp` 9395行)、`ggml/src` 約42.8万行(多くはバックエンド: CUDA/Metal/Vulkan 等)、`examples/server` 約1.2万行、`examples/cli` 約1400行。
+## 日本語
+**段階と結果(2026-11-21、すべて main に push 済み)**
+| 段階 | 内容 | 確認結果 |
+|---|---|---|
+| 1 | ログメル・スペクトログラム | 328000/328000 が C++ と完全一致(最大差 0) |
+| 2 | ggml モデルの読み込み(f32/f16/q4_0〜q8_0 の配置) | 実 `ggml-tiny.bin`(167テンソル)が独立した Python 読み取りと一致 |
+| 3 | エンコーダ(conv×2、位置埋め込み、4ブロック) | 最終文字起こしで間接的に確認 |
+| 4 | デコーダ+貪欲法(英語・時刻なし) | tiny + jfk.wav の文字起こしが whisper.cpp と一致(エンコード約3〜4秒、全体約8〜10秒) |
 
-## 段階 / Stages
-1. ✅ log-mel(dft/fft/メル)。
-2. ✅ モデル(ggml 形式)読み込み(`src/model.rs`): ヘッダ・メルフィルタ・語彙・テンソル目録(f32/f16/q4_0/q4_1/q5_0/q5_1/q8_0)。独立実装の Python 読み取りと要約が完全一致(実形式のテストモデル+各型を含む合成ファイル、`tests/ref/model_run.sh`)。**実モデルのメルフィルタ(80x201)で log-mel が C++ とビット一致**(328000/328000、`tests/ref/mel_real.sh`)。注意: `for-tests-ggml-base.bin` はテンソル0件のため、実重みでの確認は ggml-tiny 取得後(ダウンロード許可待ち)。
-3. 推論の中身: 既存 Rust 資産を使う。`open-cuda/crates/open-cuda-whisper`(921行。ライセンスは open-cuda ワークスペースが Apache-2.0 で、MIT の本リポジトリと両立)、`open-cuda`/`open-cpu` の行列演算。エンコーダ出力を C++ 版と許容誤差内で比較(次の作業)。
-4. デコーダ・トークナイザ(C++ は `std::regex` を使う。Rust で同じ分割になるかを試験)。
-5. `examples/cli` 相当、次に `examples/server`(REST は作らず Connect で)。
-6. ggml のバックエンド(GPU)は移植しない。`open-cuda` 系を使う。
+**再現**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh`(基準 `whisper-cli` を作る)→ `…/transcribe_run.sh <モデル> <wav>`。
+**正直な限界**: tiny のみ確認。f32/f16 の重みだけ(量子化は読めるが推論は未対応)。エンコーダの途中値は数値比較していない。GELU は tanh 近似。
+**未了(順に)**: 1) エンコーダ途中値の数値比較 2) 量子化重みの推論 3) ビームサーチ・時刻付き・多言語 4) CLI と Connect サーバー 5) 大きなモデル・GPU。
 
-## C/C++ が主のリポジトリ(F:\ 直下の機械的な洗い出し、ベンダー同梱物は未選別)
-- `whisper.cpp`(上記)。
-- `open-media`: C/C++ 系 398 ファイル、Fortran(.f90)124 ファイル。同梱の第三者コードの可能性が高く、**自作分かの確認が必要**。
-- `make-disk`・`open-audio-sr`・`open-music-llm`: 9千超の C/C++ ファイル(第三者の同梱 or 仮想環境の可能性、**未確認**)。
-- ほか(`MFastAPI`・`RPoRea`・`open-web-server` など)は C/C++ が 1〜6 ファイル(橋渡し・例)。
-- VPS(`/root/repository/*`、2026-11-21 読み取りのみで調査): 46リポジトリのうち C/C++ が主なのは `whisper.cpp` のみ(`open-media`・`make-disk` は F: と同じ内容)。VPS への変更なし。`pl2pl c2rust` は単純な C/C++ 向けで、whisper 規模は対象外。
+## English
+**Stages and results (2026-11-21, all pushed to main)**
+| Stage | What | Result |
+|---|---|---|
+| 1 | log-mel spectrogram | 328000/328000 bit-identical to C++ (max diff 0) |
+| 2 | ggml model loader (f32/f16/q4_0–q8_0 layouts) | real `ggml-tiny.bin` (167 tensors) matches an independent Python reader |
+| 3 | encoder (2 convs, positional embedding, 4 blocks) | checked indirectly through the final transcript |
+| 4 | decoder + greedy search (English, no timestamps) | tiny + jfk.wav transcript identical to whisper.cpp (encode ~3–4 s, whole run ~8–10 s) |
 
-## 他の言語(2026-11-20 追加指示。ファイル数の目安のみ、方針は未決)
-- Python: `open-network-amp` 155、`open-av-amp` 99、`2FastAPI` 85、`runo` 97、`open-media` 5037(多くは同梱物の可能性)。`2FastAPI`/`MFastAPI`/`RMojo` は Python 向け製品そのものなので、移植ではなく対象外にするか要判断。
-- PHP: `audiocafe-tokyo` 61、`runo` 65、`pl2pl` 29。
-- Kotlin/Swift(Android/iOS の画面): 多数。Rust 化は UI の作り直しになるため要判断。
-- JavaScript/TypeScript: Node.js を使わない方針に沿い別途(`NODEJS-REMAINING-20261119.md`)。
-- Java: `Java_to`・`pl2pl`・`aruaru-IME`・`open-backup`(各数ファイル)。
-- Fortran: `open-media` の 124 ファイル(`pl2pl f2rust` あり)。
-順序案: 自作かどうかの選別 → 小さい C/Fortran/Java から `pl2pl` で変換し出力一致を試験 → Python/PHP は機能単位で。
+**Reproduce**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (builds the reference `whisper-cli`), then `…/transcribe_run.sh <model> <wav>`.
+**Honest limits**: only tiny tested; f32/f16 weights only (quantized types parse but cannot run inference); encoder intermediates not compared numerically; GELU is the tanh approximation.
+**Open (in order)**: 1) numeric comparison of encoder intermediates 2) quantized inference 3) beam search, timestamps, multilingual 4) CLI and Connect server 5) larger models, GPU.
+
+## 简体中文
+**阶段与结果(2026-11-21,均已推送到 main)**
+| 阶段 | 内容 | 验证结果 |
+|---|---|---|
+| 1 | 对数梅尔频谱 | 328000/328000 与 C++ 完全一致(最大差 0) |
+| 2 | ggml 模型读取(f32/f16/q4_0–q8_0 布局) | 真实 `ggml-tiny.bin`(167 个张量)与独立的 Python 读取结果一致 |
+| 3 | 编码器(2 个卷积、位置嵌入、4 个块) | 通过最终转写间接验证 |
+| 4 | 解码器+贪心搜索(英语、无时间戳) | tiny + jfk.wav 的转写与 whisper.cpp 一致(编码约 3–4 秒,整体约 8–10 秒) |
+
+**复现**:`wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh`(构建基准 `whisper-cli`),然后运行 `…/transcribe_run.sh <模型> <wav>`。
+**如实说明的局限**:只验证了 tiny;仅支持 f32/f16 权重(量化类型能解析但不能推理);编码器中间值未做数值比较;GELU 为 tanh 近似。
+**未完成(按顺序)**:1) 编码器中间值的数值比较 2) 量化权重推理 3) 束搜索、时间戳、多语言 4) CLI 与 Connect 服务器 5) 更大的模型、GPU。
+
+## 繁體中文
+**階段與結果(2026-11-21,均已推送到 main)**
+| 階段 | 內容 | 驗證結果 |
+|---|---|---|
+| 1 | 對數梅爾頻譜 | 328000/328000 與 C++ 完全一致(最大差 0) |
+| 2 | ggml 模型讀取(f32/f16/q4_0–q8_0 佈局) | 真實 `ggml-tiny.bin`(167 個張量)與獨立的 Python 讀取結果一致 |
+| 3 | 編碼器(2 個卷積、位置嵌入、4 個區塊) | 透過最終轉寫間接驗證 |
+| 4 | 解碼器+貪婪搜尋(英語、無時間戳) | tiny + jfk.wav 的轉寫與 whisper.cpp 一致(編碼約 3–4 秒,整體約 8–10 秒) |
+
+**重現**:`wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh`(建置基準 `whisper-cli`),再執行 `…/transcribe_run.sh <模型> <wav>`。
+**如實說明的限制**:只驗證了 tiny;僅支援 f32/f16 權重(量化類型可解析但無法推論);編碼器中間值未做數值比對;GELU 為 tanh 近似。
+**尚待完成(依序)**:1) 編碼器中間值的數值比對 2) 量化權重推論 3) 束搜尋、時間戳、多語言 4) CLI 與 Connect 伺服器 5) 更大的模型、GPU。
+
+## 한국어
+**단계와 결과(2026-11-21, 모두 main에 push 완료)**
+| 단계 | 내용 | 확인 결과 |
+|---|---|---|
+| 1 | 로그 멜 스펙트로그램 | 328000/328000이 C++와 완전 일치(최대 차이 0) |
+| 2 | ggml 모델 읽기(f32/f16/q4_0–q8_0 배치) | 실제 `ggml-tiny.bin`(텐서 167개)이 독립된 Python 읽기와 일치 |
+| 3 | 인코더(컨볼루션 2개, 위치 임베딩, 블록 4개) | 최종 전사를 통해 간접 확인 |
+| 4 | 디코더 + 탐욕 탐색(영어, 타임스탬프 없음) | tiny + jfk.wav 전사가 whisper.cpp와 일치(인코딩 약 3~4초, 전체 약 8~10초) |
+
+**재현**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh`(기준 `whisper-cli` 빌드) 후 `…/transcribe_run.sh <모델> <wav>`.
+**솔직한 한계**: tiny만 확인했습니다. f32/f16 가중치만 지원합니다(양자화 형식은 읽지만 추론은 못 합니다). 인코더 중간값은 수치 비교를 하지 않았고, GELU는 tanh 근사입니다.
+**미완료(순서대로)**: 1) 인코더 중간값 수치 비교 2) 양자화 가중치 추론 3) 빔 서치·타임스탬프·다국어 4) CLI와 Connect 서버 5) 더 큰 모델·GPU.
+
+## Deutsch
+**Stufen und Ergebnisse (2026-11-21, alles auf main gepusht)**
+| Stufe | Inhalt | Ergebnis |
+|---|---|---|
+| 1 | Log-Mel-Spektrogramm | 328000/328000 bitgleich mit C++ (maximale Abweichung 0) |
+| 2 | ggml-Modell laden (Layouts f32/f16/q4_0–q8_0) | echtes `ggml-tiny.bin` (167 Tensoren) stimmt mit einem unabhängigen Python-Leser überein |
+| 3 | Encoder (2 Faltungen, Positionseinbettung, 4 Blöcke) | indirekt über das fertige Transkript geprüft |
+| 4 | Decoder + Greedy-Suche (Englisch, ohne Zeitstempel) | Transkript von tiny + jfk.wav identisch mit whisper.cpp (Encoder ca. 3–4 s, gesamt ca. 8–10 s) |
+
+**Nachstellen**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (baut das Referenz-`whisper-cli`), danach `…/transcribe_run.sh <Modell> <wav>`.
+**Ehrliche Grenzen**: nur tiny getestet; nur f32/f16-Gewichte (quantisierte Typen werden gelesen, aber nicht für Inferenz genutzt); Encoder-Zwischenwerte nicht numerisch verglichen; GELU ist die tanh-Näherung.
+**Offen (der Reihe nach)**: 1) numerischer Vergleich der Encoder-Zwischenwerte 2) Inferenz mit quantisierten Gewichten 3) Beam Search, Zeitstempel, Mehrsprachigkeit 4) CLI und Connect-Server 5) größere Modelle, GPU.
+
+## Français
+**Étapes et résultats (2026-11-21, tout est poussé sur main)**
+| Étape | Contenu | Résultat |
+|---|---|---|
+| 1 | spectrogramme log-mel | 328000/328000 identique bit à bit à C++ (écart max. 0) |
+| 2 | chargement du modèle ggml (formats f32/f16/q4_0–q8_0) | le vrai `ggml-tiny.bin` (167 tenseurs) correspond à un lecteur Python indépendant |
+| 3 | encodeur (2 convolutions, plongement de position, 4 blocs) | vérifié indirectement par la transcription finale |
+| 4 | décodeur + recherche gloutonne (anglais, sans horodatage) | transcription de tiny + jfk.wav identique à whisper.cpp (encodeur ≈ 3–4 s, total ≈ 8–10 s) |
+
+**Reproduire** : `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (construit le `whisper-cli` de référence), puis `…/transcribe_run.sh <modèle> <wav>`.
+**Limites, franchement** : seul tiny a été testé ; uniquement des poids f32/f16 (les types quantifiés sont lus mais pas utilisés en inférence) ; valeurs intermédiaires de l'encodeur non comparées numériquement ; GELU en approximation tanh.
+**À faire (dans l'ordre)** : 1) comparaison numérique des valeurs intermédiaires de l'encodeur 2) inférence avec poids quantifiés 3) recherche par faisceau, horodatage, multilingue 4) CLI et serveur Connect 5) modèles plus grands, GPU.
+
+## Español
+**Etapas y resultados (2026-11-21, todo subido a main)**
+| Etapa | Contenido | Resultado |
+|---|---|---|
+| 1 | espectrograma log-mel | 328000/328000 idéntico bit a bit a C++ (diferencia máxima 0) |
+| 2 | carga del modelo ggml (formatos f32/f16/q4_0–q8_0) | el `ggml-tiny.bin` real (167 tensores) coincide con un lector Python independiente |
+| 3 | codificador (2 convoluciones, incrustación posicional, 4 bloques) | comprobado indirectamente con la transcripción final |
+| 4 | decodificador + búsqueda voraz (inglés, sin marcas de tiempo) | la transcripción de tiny + jfk.wav es idéntica a la de whisper.cpp (codificador ≈ 3–4 s, total ≈ 8–10 s) |
+
+**Reproducir**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (compila el `whisper-cli` de referencia) y luego `…/transcribe_run.sh <modelo> <wav>`.
+**Límites, con franqueza**: solo se probó tiny; solo pesos f32/f16 (los tipos cuantizados se leen, pero no se usan para inferir); los valores intermedios del codificador no se compararon numéricamente; GELU es la aproximación tanh.
+**Pendiente (en orden)**: 1) comparación numérica de los valores intermedios del codificador 2) inferencia con pesos cuantizados 3) búsqueda por haz, marcas de tiempo, multilingüe 4) CLI y servidor Connect 5) modelos más grandes, GPU.
+
+## Português
+**Etapas e resultados (2026-11-21, tudo enviado para a main)**
+| Etapa | Conteúdo | Resultado |
+|---|---|---|
+| 1 | espectrograma log-mel | 328000/328000 idêntico bit a bit ao C++ (diferença máxima 0) |
+| 2 | carregamento do modelo ggml (formatos f32/f16/q4_0–q8_0) | o `ggml-tiny.bin` real (167 tensores) coincide com um leitor Python independente |
+| 3 | codificador (2 convoluções, incorporação posicional, 4 blocos) | verificado indiretamente pela transcrição final |
+| 4 | decodificador + busca gulosa (inglês, sem marcas de tempo) | transcrição de tiny + jfk.wav idêntica à do whisper.cpp (codificador ≈ 3–4 s, total ≈ 8–10 s) |
+
+**Reproduzir**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (compila o `whisper-cli` de referência) e depois `…/transcribe_run.sh <modelo> <wav>`.
+**Limites, com franqueza**: só o tiny foi testado; apenas pesos f32/f16 (os tipos quantizados são lidos, mas não usados na inferência); valores intermediários do codificador não foram comparados numericamente; GELU é a aproximação tanh.
+**Pendente (em ordem)**: 1) comparação numérica dos valores intermediários do codificador 2) inferência com pesos quantizados 3) busca em feixe, marcas de tempo, multilíngue 4) CLI e servidor Connect 5) modelos maiores, GPU.
+
+## Русский
+**Этапы и результаты (2026-11-21, всё отправлено в main)**
+| Этап | Что сделано | Результат |
+|---|---|---|
+| 1 | лог-мел-спектрограмма | 328000/328000 совпадает с C++ побитно (максимальная разница 0) |
+| 2 | загрузка модели ggml (форматы f32/f16/q4_0–q8_0) | настоящий `ggml-tiny.bin` (167 тензоров) совпал с независимым чтением на Python |
+| 3 | энкодер (2 свёртки, позиционное вложение, 4 блока) | проверен косвенно по итоговой транскрипции |
+| 4 | декодер + жадный поиск (английский, без временных меток) | транскрипция tiny + jfk.wav идентична whisper.cpp (энкодер ≈ 3–4 с, всего ≈ 8–10 с) |
+
+**Как повторить**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (собирает эталонный `whisper-cli`), затем `…/transcribe_run.sh <модель> <wav>`.
+**Честные ограничения**: проверен только tiny; только веса f32/f16 (квантованные типы читаются, но для вывода не используются); промежуточные значения энкодера численно не сравнивались; GELU — приближение tanh.
+**Осталось (по порядку)**: 1) численное сравнение промежуточных значений энкодера 2) вывод на квантованных весах 3) лучевой поиск, временные метки, многоязычность 4) CLI и сервер Connect 5) более крупные модели, GPU.
+
+## العربية
+<div dir="rtl">
+
+**المراحل والنتائج (2026-11-21، وكلها مدفوعة إلى main)**
+| المرحلة | المحتوى | نتيجة التحقق |
+|---|---|---|
+| 1 | طيف ميل اللوغاريتمي | 328000/328000 مطابق بتًّا ببت لـ C++ (أقصى فرق 0) |
+| 2 | تحميل نموذج ggml (تخطيطات f32/f16/q4_0–q8_0) | الملف الحقيقي `ggml-tiny.bin` (167 موتّرًا) يطابق قارئ Python مستقلًّا |
+| 3 | المشفّر (التفافان، تضمين موضعي، 4 كتل) | تم التحقق منه بصورة غير مباشرة عبر النص النهائي |
+| 4 | المفكّك + البحث الجشع (إنجليزي، بلا طوابع زمنية) | نص tiny مع jfk.wav مطابق لنص whisper.cpp (المشفّر نحو 3–4 ثوانٍ، والكل نحو 8–10 ثوانٍ) |
+
+**إعادة التجربة**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (يبني `whisper-cli` المرجعي)، ثم `…/transcribe_run.sh <النموذج> <wav>`.
+**حدود بصراحة**: لم يُختبر إلا tiny؛ تُدعم أوزان f32/f16 فقط (تُقرأ الأنواع المكمّمة لكن لا تُستخدم في الاستدلال)؛ لم تُقارَن القيم الوسيطة في المشفّر عدديًّا؛ وGELU تقريب tanh.
+**المتبقي (بالترتيب)**: 1) المقارنة العددية للقيم الوسيطة في المشفّر 2) الاستدلال بالأوزان المكمّمة 3) البحث الشعاعي والطوابع الزمنية وتعدد اللغات 4) CLI وخادم Connect 5) نماذج أكبر وGPU.
+
+</div>
+
+## فارسی
+<div dir="rtl">
+
+**مرحله‌ها و نتیجه‌ها (۲۰۲۶-۱۱-۲۱، همه به main فرستاده شده)**
+| مرحله | محتوا | نتیجهٔ بررسی |
+|---|---|---|
+| ۱ | طیف‌نگار لگاریتمی مل | ۳۲۸۰۰۰ از ۳۲۸۰۰۰ بیت‌به‌بیت با C++‎ یکسان (بیشینهٔ اختلاف ۰) |
+| ۲ | بارگذاری مدل ggml (چیدمان‌های f32/f16/q4_0–q8_0) | فایل واقعی `ggml-tiny.bin` (۱۶۷ تانسور) با خوانندهٔ مستقل Python یکسان است |
+| ۳ | رمزگذار (۲ کانولوشن، تعبیهٔ مکانی، ۴ بلوک) | به‌طور غیرمستقیم از راه متن نهایی بررسی شد |
+| ۴ | رمزگشا + جستجوی حریصانه (انگلیسی، بدون برچسب زمانی) | رونویسی tiny با jfk.wav با whisper.cpp یکسان است (رمزگذار حدود ۳ تا ۴ ثانیه، کل حدود ۸ تا ۱۰ ثانیه) |
+
+**بازتولید**: `wsl -d Ubuntu-24.04 -- bash /mnt/f/rs-whisper/tests/ref/build_cpp.sh` (`whisper-cli` مرجع را می‌سازد) و سپس `…/transcribe_run.sh <مدل> <wav>`.
+**محدودیت‌ها، صادقانه**: فقط tiny آزموده شده؛ فقط وزن‌های f32/f16 (نوع‌های کوانتیزه خوانده می‌شوند ولی در استنتاج به کار نمی‌روند)؛ مقدارهای میانی رمزگذار به‌صورت عددی مقایسه نشده‌اند؛ GELU تقریب tanh است.
+**باقی‌مانده (به ترتیب)**: ۱) مقایسهٔ عددی مقدارهای میانی رمزگذار ۲) استنتاج با وزن‌های کوانتیزه ۳) جستجوی پرتویی، برچسب زمانی، چندزبانه ۴) CLI و سرور Connect ۵) مدل‌های بزرگ‌تر و GPU.
+
+</div>
