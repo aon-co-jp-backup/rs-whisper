@@ -305,6 +305,11 @@ impl Whisper {
                 break;
             }
             toks.push(best as u32);
+            // Repetition guard: a too-short window can make the decoder loop on one token.
+            if toks.len() >= n_prompt + 6 && toks[toks.len() - 6..].iter().all(|&t| t == best as u32) {
+                toks.truncate(toks.len() - 5);
+                break;
+            }
         }
         let mut bytes = Vec::new();
         for &t in &toks[n_prompt..] {
