@@ -117,6 +117,8 @@ fn attention(q: &[f32], tq: usize, k: &[f32], v: &[f32], tk: usize, d: usize, he
 
 pub struct Whisper {
     w: W,
+    /// Encoder context length (1500 = full 30 s window; smaller = shorter window, like whisper.cpp -ac).
+    pub audio_ctx: usize,
     pub n_state: usize,
     heads: usize,
     n_enc_layer: usize,
@@ -130,6 +132,7 @@ impl Whisper {
         let h = &m.hparams;
         Whisper {
             w: W::new(m, bytes),
+            audio_ctx: N_CTX,
             n_state: h.n_audio_state as usize,
             heads: h.n_audio_head as usize,
             n_enc_layer: h.n_audio_layer as usize,
@@ -142,17 +145,19 @@ impl Whisper {
     /// mel: [n_mel][n_len] (first N_FRAMES frames used) -> encoder output [N_CTX][n_state]
     pub fn encode(&self, mel: &[f32], n_mel: usize, n_len: usize) -> Vec<f32> {
         let d = self.n_state;
+        let nctx = self.audio_ctx.clamp(1, N_CTX);
+        let nframes = nctx * 2;
         // conv1: k=3,s=1,p=1 : [n_mel][3000] -> [3000][d]
         let w1 = self.w.g("encoder.conv1.weight");
         let b1 = self.w.g("encoder.conv1.bias");
-        let mut x1 = vec![0f32; N_FRAMES * d];
+        let mut x1 = vec![0f32; nframes * d];
         par_rows(&mut x1, d, |t, row| {
             for o in 0..d {
                 let mut s = b1[o];
                 for c in 0..n_mel {
                     for kk in 0..3 {
                         let ti = t as isize + kk as isize - 1;
-                        if ti >= 0 && (ti as usize) < N_FRAMES {
+                        if ti >= 0 && (ti as usize) < nframes {
                             s += w1[(o * n_mel + c) * 3 + kk] * mel[c * n_len + ti as usize];
                         }
                     }
@@ -163,13 +168,13 @@ impl Whisper {
         // conv2: k=3,s=2,p=1 : [3000][d] -> [1500][d]
         let w2 = self.w.g("encoder.conv2.weight");
         let b2 = self.w.g("encoder.conv2.bias");
-        let mut x = vec![0f32; N_CTX * d];
+        let mut x = vec![0f32; nctx * d];
         par_rows(&mut x, d, |t, row| {
             for o in 0..d {
                 let mut s = b2[o];
                 for kk in 0..3 {
                     let ti = (t * 2) as isize + kk as isize - 1;
-                    if ti >= 0 && (ti as usize) < N_FRAMES {
+                    if ti >= 0 && (ti as usize) < nframes {
                         let xr = &x1[ti as usize * d..(ti as usize + 1) * d];
                         let wr = &w2[(o * d) * 3..];
                         for c in 0..d {
@@ -181,7 +186,7 @@ impl Whisper {
             }
         });
         let pe = self.w.g("encoder.positional_embedding");
-        for i in 0..N_CTX * d {
+        for i in 0..nctx * d {
             x[i] += pe[i];
         }
         for l in 0..self.n_enc_layer {
@@ -189,21 +194,21 @@ impl Whisper {
             let g = |n: &str| self.w.g(&format!("{p}{n}"));
             let mut a = x.clone();
             layer_norm(&mut a, d, g("attn_ln.weight"), g("attn_ln.bias"));
-            let q = linear(&a, N_CTX, d, g("attn.query.weight"), d, Some(g("attn.query.bias")));
-            let k = linear(&a, N_CTX, d, g("attn.key.weight"), d, None);
-            let v = linear(&a, N_CTX, d, g("attn.value.weight"), d, Some(g("attn.value.bias")));
-            let at = attention(&q, N_CTX, &k, &v, N_CTX, d, self.heads, false);
-            let o = linear(&at, N_CTX, d, g("attn.out.weight"), d, Some(g("attn.out.bias")));
+            let q = linear(&a, nctx, d, g("attn.query.weight"), d, Some(g("attn.query.bias")));
+            let k = linear(&a, nctx, d, g("attn.key.weight"), d, None);
+            let v = linear(&a, nctx, d, g("attn.value.weight"), d, Some(g("attn.value.bias")));
+            let at = attention(&q, nctx, &k, &v, nctx, d, self.heads, false);
+            let o = linear(&at, nctx, d, g("attn.out.weight"), d, Some(g("attn.out.bias")));
             for i in 0..x.len() {
                 x[i] += o[i];
             }
             let mut m = x.clone();
             layer_norm(&mut m, d, g("mlp_ln.weight"), g("mlp_ln.bias"));
-            let mut h = linear(&m, N_CTX, d, g("mlp.0.weight"), d * 4, Some(g("mlp.0.bias")));
+            let mut h = linear(&m, nctx, d, g("mlp.0.weight"), d * 4, Some(g("mlp.0.bias")));
             for v in h.iter_mut() {
                 *v = gelu(*v);
             }
-            let o = linear(&h, N_CTX, d * 4, g("mlp.2.weight"), d, Some(g("mlp.2.bias")));
+            let o = linear(&h, nctx, d * 4, g("mlp.2.weight"), d, Some(g("mlp.2.bias")));
             for i in 0..x.len() {
                 x[i] += o[i];
             }
@@ -241,7 +246,7 @@ impl Whisper {
             let mut c = x.clone();
             layer_norm(&mut c, d, g("cross_attn_ln.weight"), g("cross_attn_ln.bias"));
             let q = linear(&c, t, d, g("cross_attn.query.weight"), d, Some(g("cross_attn.query.bias")));
-            let at = attention(&q, t, &cross[l].0, &cross[l].1, N_CTX, d, self.heads, false);
+            let at = attention(&q, t, &cross[l].0, &cross[l].1, enc.len() / d, d, self.heads, false);
             let o = linear(&at, t, d, g("cross_attn.out.weight"), d, Some(g("cross_attn.out.bias")));
             for i in 0..x.len() {
                 x[i] += o[i];
@@ -269,8 +274,8 @@ impl Whisper {
             .map(|l| {
                 let p = format!("decoder.blocks.{l}.cross_attn.");
                 (
-                    linear(enc, N_CTX, d, self.w.g(&format!("{p}key.weight")), d, None),
-                    linear(enc, N_CTX, d, self.w.g(&format!("{p}value.weight")), d, Some(self.w.g(&format!("{p}value.bias")))),
+                    linear(enc, enc.len() / d, d, self.w.g(&format!("{p}key.weight")), d, None),
+                    linear(enc, enc.len() / d, d, self.w.g(&format!("{p}value.weight")), d, Some(self.w.g(&format!("{p}value.bias")))),
                 )
             })
             .collect();

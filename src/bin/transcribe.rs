@@ -11,7 +11,10 @@ fn main() {
         .collect();
     let n_mel = m.n_mel as usize;
     let (mel, n_len) = log_mel_spectrogram(&samples, &m.filters, n_mel);
-    let w = Whisper::new(&m, &bytes);
+    let mut w = Whisper::new(&m, &bytes);
+    if let Some(c) = std::env::var("RS_WHISPER_AUDIO_CTX").ok().and_then(|v| v.parse().ok()) {
+        w.audio_ctx = c;
+    }
     let t0 = std::time::Instant::now();
     let enc = w.encode(&mel, n_mel, n_len);
     eprintln!("encode: {:.1}s", t0.elapsed().as_secs_f32());
