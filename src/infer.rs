@@ -305,12 +305,24 @@ impl Whisper {
                 break;
             }
             toks.push(best as u32);
+            // Phrase-loop guard: the last k tokens equal the k before them.
+            for k in 3..=40usize {
+                let n = toks.len();
+                if n >= n_prompt + 2 * k && toks[n - k..] == toks[n - 2 * k..n - k] {
+                    toks.truncate(n - k);
+                    return self.finish(&toks, n_prompt);
+                }
+            }
             // Repetition guard: a too-short window can make the decoder loop on one token.
             if toks.len() >= n_prompt + 6 && toks[toks.len() - 6..].iter().all(|&t| t == best as u32) {
                 toks.truncate(toks.len() - 5);
                 break;
             }
         }
+        self.finish(&toks, n_prompt)
+    }
+
+    fn finish(&self, toks: &[u32], n_prompt: usize) -> (String, Vec<u32>) {
         let mut bytes = Vec::new();
         for &t in &toks[n_prompt..] {
             bytes.extend_from_slice(&self.vocab[t as usize]);

@@ -23,3 +23,7 @@ path = "src/bin/transcribe.rs"
 
 [profile.release]
 opt-level = 3
+
+[[bin]]
+name = "rs-whisper-stream"
+path = "src/bin/stream.rs"
