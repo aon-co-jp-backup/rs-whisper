@@ -161,6 +161,7 @@ pub fn log_mel_spectrogram(samples: &[f32], filters: &[f32], n_mel: usize) -> (V
     (mel, n_len)
 }
 
+pub mod merge;
 pub mod model;
 
 pub mod infer;
