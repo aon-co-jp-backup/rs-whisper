@@ -80,7 +80,8 @@ fn main() {
         let t0 = std::time::Instant::now();
         let enc = w.encode(&mel, n_mel, n_len);
         let (text, _) = w.transcribe_greedy(&enc, (secs * 6.0) as usize + 8);
-        let words: Vec<String> = text.split_whitespace().map(String::from).collect();
+        let mut words: Vec<String> = text.split_whitespace().map(String::from).collect();
+        rs_whisper::merge::drop_dangling(&mut words);
         let dropped = rs_whisper::merge::append_dedup(&mut merged, &words);
         println!("[{:5.2}-{:5.2}s] ({:.1}s to process, window {} ) {}", s as f32 / SR as f32, e as f32 / SR as f32, t0.elapsed().as_secs_f32(), w.audio_ctx, text.trim());
         if dropped > 0 {

@@ -19,6 +19,15 @@ pub fn append_dedup(acc: &mut Vec<String>, new: &[String]) -> usize {
     k
 }
 
+/// Drops a lone unfinished word after the last sentence end (".", "?", "!"): at a segment end the decoder
+/// sometimes appends the start of a sentence that is not there. Segments without any sentence end are kept.
+pub fn drop_dangling(words: &mut Vec<String>) {
+    let end = |w: &String| w.ends_with(|c| matches!(c, '.' | '?' | '!'));
+    if words.len() >= 2 && !end(&words[words.len() - 1]) && end(&words[words.len() - 2]) {
+        words.pop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,5 +51,14 @@ mod tests {
         let mut a = v("hello there");
         assert_eq!(append_dedup(&mut a, &v("general kenobi")), 0);
         assert_eq!(a.len(), 4);
+    }
+    #[test]
+    fn dangling_word_dropped_only_after_sentence_end() {
+        let mut a = v("ask what you can do. Ask");
+        drop_dangling(&mut a);
+        assert_eq!(a.join(" "), "ask what you can do.");
+        let mut b = v("and so my fellow Americans");
+        drop_dangling(&mut b);
+        assert_eq!(b.len(), 5);
     }
 }
