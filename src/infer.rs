@@ -322,6 +322,268 @@ impl Whisper {
         self.finish(&toks, n_prompt)
     }
 
+    /// Greedy decoding WITH timestamp tokens (whisper rules). Returns segments (start s, end s, text).
+    pub fn transcribe_segments(&self, enc: &[f32], max_tokens: usize) -> Vec<(f32, f32, String)> {
+        let d = self.n_state;
+        let cross: Vec<(Vec<f32>, Vec<f32>)> = (0..self.n_dec_layer)
+            .map(|l| {
+                let p = format!("decoder.blocks.{l}.cross_attn.");
+                (
+                    linear(enc, enc.len() / d, d, self.w.g(&format!("{p}key.weight")), d, None),
+                    linear(enc, enc.len() / d, d, self.w.g(&format!("{p}value.weight")), d, Some(self.w.g(&format!("{p}value.bias")))),
+                )
+            })
+            .collect();
+        let (eot, sot, en, transcribe, ts0) = (50257u32, 50258u32, 50259u32, 50359u32, 50364u32);
+        let mut toks = vec![sot, en, transcribe];
+        let n_prompt = toks.len();
+        let mut max_ts = ts0;
+        for _ in 0..max_tokens {
+            let mut lg = self.logits(&toks, enc, &cross);
+            for i in 50258..ts0 as usize {
+                lg[i] = f32::NEG_INFINITY;
+            }
+            let seq = &toks[n_prompt..];
+            let last_ts = seq.last().map_or(false, |&t| t >= ts0);
+            let pen_ts = seq.len() < 2 || seq[seq.len() - 2] >= ts0;
+            if last_ts {
+                if pen_ts {
+                    for v in lg[ts0 as usize..].iter_mut() {
+                        *v = f32::NEG_INFINITY;
+                    }
+                } else {
+                    for v in lg[..eot as usize].iter_mut() {
+                        *v = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            if seq.is_empty() {
+                for v in lg[..ts0 as usize].iter_mut() {
+                    *v = f32::NEG_INFINITY;
+                }
+            } else {
+                lg[eot as usize] = if last_ts && !pen_ts { lg[eot as usize] } else if last_ts { lg[eot as usize] } else { f32::NEG_INFINITY };
+            }
+            // timestamps never go backwards
+            for v in lg[ts0 as usize..max_ts as usize].iter_mut() {
+                *v = f32::NEG_INFINITY;
+            }
+            let mut best = 0usize;
+            for i in 1..lg.len() {
+                if lg[i] > lg[best] {
+                    best = i;
+                }
+            }
+            if best as u32 == eot {
+                break;
+            }
+            if best as u32 >= ts0 {
+                max_ts = best as u32;
+            }
+            toks.push(best as u32);
+            for k in 3..=40usize {
+                let n = toks.len();
+                if n >= n_prompt + 2 * k && toks[n - k..] == toks[n - 2 * k..n - k] {
+                    toks.truncate(n - k);
+                    return self.parse_segments(&toks[n_prompt..]);
+                }
+            }
+            if toks.len() >= n_prompt + 6 && toks[toks.len() - 6..].iter().all(|&t| t == best as u32) {
+                toks.truncate(toks.len() - 5);
+                break;
+            }
+        }
+        self.parse_segments(&toks[n_prompt..])
+    }
+
+    /// Per-token start times (seconds) by cross-attention DTW (whisper.cpp style).
+    /// `text` = text token ids (no special tokens). Returns one start time per token.
+    pub fn token_times(&self, enc: &[f32], text: &[u32]) -> Vec<f32> {
+        let d = self.n_state;
+        let nf = enc.len() / d;
+        if text.is_empty() || nf == 0 {
+            return vec![];
+        }
+        // alignment heads of multilingual tiny (layer, head)
+        let heads_sel: &[(usize, usize)] = &[(2, 2), (3, 0), (3, 2), (3, 3), (3, 4), (3, 5)];
+        let max_l = heads_sel.iter().map(|h| h.0).max().unwrap().min(self.n_dec_layer - 1);
+        let cross: Vec<(Vec<f32>, Vec<f32>)> = (0..=max_l)
+            .map(|l| {
+                let p = format!("decoder.blocks.{l}.cross_attn.");
+                (
+                    linear(enc, nf, d, self.w.g(&format!("{p}key.weight")), d, None),
+                    linear(enc, nf, d, self.w.g(&format!("{p}value.weight")), d, Some(self.w.g(&format!("{p}value.bias")))),
+                )
+            })
+            .collect();
+        let (sot, en, transcribe, nots) = (50258u32, 50259u32, 50359u32, 50363u32);
+        let mut toks = vec![sot, en, transcribe, nots];
+        let np = toks.len();
+        toks.extend_from_slice(text);
+        toks.push(50257);
+        let t = toks.len();
+        let emb = self.w.g("decoder.token_embedding.weight");
+        let pos = self.w.g("decoder.positional_embedding");
+        let mut x = vec![0f32; t * d];
+        for (i, &tk) in toks.iter().enumerate() {
+            for c in 0..d {
+                x[i * d + c] = emb[tk as usize * d + c] + pos[i * d + c];
+            }
+        }
+        let hd = d / self.heads;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut wts = vec![0f32; t * nf];
+        let mut nsel = 0f32;
+        for l in 0..=max_l {
+            let p = format!("decoder.blocks.{l}.");
+            let g = |n: &str| self.w.g(&format!("{p}{n}"));
+            let mut a = x.clone();
+            layer_norm(&mut a, d, g("attn_ln.weight"), g("attn_ln.bias"));
+            let q = linear(&a, t, d, g("attn.query.weight"), d, Some(g("attn.query.bias")));
+            let k = linear(&a, t, d, g("attn.key.weight"), d, None);
+            let v = linear(&a, t, d, g("attn.value.weight"), d, Some(g("attn.value.bias")));
+            let at = attention(&q, t, &k, &v, t, d, self.heads, true);
+            let o = linear(&at, t, d, g("attn.out.weight"), d, Some(g("attn.out.bias")));
+            for i in 0..x.len() {
+                x[i] += o[i];
+            }
+            let mut c = x.clone();
+            layer_norm(&mut c, d, g("cross_attn_ln.weight"), g("cross_attn_ln.bias"));
+            let q = linear(&c, t, d, g("cross_attn.query.weight"), d, Some(g("cross_attn.query.bias")));
+            for &(_, h) in heads_sel.iter().filter(|h| h.0 == l) {
+                nsel += 1.0;
+                for i in 0..t {
+                    let qh = &q[i * d + h * hd..i * d + (h + 1) * hd];
+                    let mut sc = vec![0f32; nf];
+                    let mut mx = f32::NEG_INFINITY;
+                    for j in 0..nf {
+                        let kh = &cross[l].0[j * d + h * hd..j * d + (h + 1) * hd];
+                        let mut sdot = 0f32;
+                        for cc in 0..hd {
+                            sdot += qh[cc] * kh[cc];
+                        }
+                        sc[j] = sdot * scale;
+                        mx = mx.max(sc[j]);
+                    }
+                    let mut sum = 0f32;
+                    for j in 0..nf {
+                        sc[j] = (sc[j] - mx).exp();
+                        sum += sc[j];
+                    }
+                    for j in 0..nf {
+                        wts[i * nf + j] += sc[j] / sum;
+                    }
+                }
+            }
+            let at = attention(&q, t, &cross[l].0, &cross[l].1, nf, d, self.heads, false);
+            let o = linear(&at, t, d, g("cross_attn.out.weight"), d, Some(g("cross_attn.out.bias")));
+            for i in 0..x.len() {
+                x[i] += o[i];
+            }
+            let mut m = x.clone();
+            layer_norm(&mut m, d, g("mlp_ln.weight"), g("mlp_ln.bias"));
+            let mut hh = linear(&m, t, d, g("mlp.0.weight"), d * 4, Some(g("mlp.0.bias")));
+            for vv in hh.iter_mut() {
+                *vv = gelu(*vv);
+            }
+            let o = linear(&hh, t, d * 4, g("mlp.2.weight"), d, Some(g("mlp.2.bias")));
+            for i in 0..x.len() {
+                x[i] += o[i];
+            }
+        }
+        for v in wts.iter_mut() {
+            *v /= nsel.max(1.0);
+        }
+        // row r predicts token r+1: rows np-1 .. t-2 predict the text tokens, t-1 predicts eot
+        let n = text.len() + 1;
+        let mut m = vec![0f32; n * nf];
+        for ri in 0..n {
+            let r = np - 1 + ri;
+            for j in 0..nf {
+                m[ri * nf + j] = wts[r * nf + j];
+            }
+        }
+        for j in 0..nf {
+            let mean: f32 = (0..n).map(|i| m[i * nf + j]).sum::<f32>() / n as f32;
+            let var: f32 = (0..n).map(|i| (m[i * nf + j] - mean).powi(2)).sum::<f32>() / n as f32;
+            let sd = var.sqrt().max(1e-6);
+            for i in 0..n {
+                m[i * nf + j] = (m[i * nf + j] - mean) / sd;
+            }
+        }
+        for i in 0..n {
+            let row: Vec<f32> = m[i * nf..(i + 1) * nf].to_vec();
+            for j in 0..nf {
+                let (a, b) = (j.saturating_sub(3), (j + 4).min(nf));
+                let mut w: Vec<f32> = row[a..b].to_vec();
+                w.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                m[i * nf + j] = w[w.len() / 2];
+            }
+        }
+        // DTW maximising the summed score on a monotone path (0,0) -> (n-1, nf-1)
+        let neg = f32::NEG_INFINITY;
+        let mut cost = vec![neg; n * nf];
+        let mut bt = vec![0u8; n * nf];
+        cost[0] = m[0];
+        for i in 0..n {
+            for j in 0..nf {
+                if i == 0 && j == 0 {
+                    continue;
+                }
+                let up = if i > 0 { cost[(i - 1) * nf + j] } else { neg };
+                let left = if j > 0 { cost[i * nf + j - 1] } else { neg };
+                let diag = if i > 0 && j > 0 { cost[(i - 1) * nf + j - 1] } else { neg };
+                let (b, c) = if diag >= up && diag >= left { (0u8, diag) } else if up >= left { (1, up) } else { (2, left) };
+                cost[i * nf + j] = c + m[i * nf + j];
+                bt[i * nf + j] = b;
+            }
+        }
+        // token start = first frame of the path on that row
+        let mut start = vec![0f32; n];
+        let (mut i, mut j) = (n - 1, nf - 1);
+        loop {
+            start[i] = j as f32 * 0.02;
+            if i == 0 && j == 0 {
+                break;
+            }
+            match bt[i * nf + j] {
+                0 => {
+                    i -= 1;
+                    j -= 1;
+                }
+                1 => i -= 1,
+                _ => j -= 1,
+            }
+        }
+        start.truncate(text.len());
+        start
+    }
+
+    fn parse_segments(&self, seq: &[u32]) -> Vec<(f32, f32, String)> {
+        let ts0 = 50364u32;
+        let t = |x: u32| (x - ts0) as f32 * 0.02;
+        let mut out = Vec::new();
+        let (mut start, mut bytes): (Option<f32>, Vec<u8>) = (None, Vec::new());
+        for &x in seq {
+            if x >= ts0 {
+                match start {
+                    Some(s) if !bytes.is_empty() => {
+                        out.push((s, t(x), String::from_utf8_lossy(&bytes).into_owned()));
+                        start = None;
+                        bytes.clear();
+                    }
+                    _ => start = Some(t(x)),
+                }
+            } else {
+                bytes.extend_from_slice(&self.vocab[x as usize]);
+            }
+        }
+        if let (Some(s), false) = (start, bytes.is_empty()) {
+            out.push((s, f32::INFINITY, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        out
+    }
+
     fn finish(&self, toks: &[u32], n_prompt: usize) -> (String, Vec<u32>) {
         let mut bytes = Vec::new();
         for &t in &toks[n_prompt..] {

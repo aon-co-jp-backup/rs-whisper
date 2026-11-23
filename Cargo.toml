@@ -31,3 +31,7 @@ path = "src/bin/stream.rs"
 [[bin]]
 name = "rs-whisper-la"
 path = "src/bin/la.rs"
+
+[[bin]]
+name = "rs-whisper-ts"
+path = "src/bin/ts.rs"
