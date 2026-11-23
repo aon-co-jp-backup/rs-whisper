@@ -131,3 +131,7 @@
 ۸. **اسناد**: README و CLAUDE و PORTING و POLICY به ۱۲ زبان نوشته می‌شوند: ژاپنی، انگلیسی، چینی ساده، چینی سنتی، کره‌ای، آلمانی، فرانسوی، اسپانیایی، پرتغالی، روسی، عربی و فارسی. ذکر می‌شود که ترجمه‌ها با هوش مصنوعی انجام شده‌اند و نتیجهٔ بازبینی گویشورانِ بومی ثبت می‌شود.
 
 </div>
+
+## 2026-11-23 rs-whisper-la / word times
+日本語: `rs-whisper-ts`(語時刻の確認)と `rs-whisper-la`(LocalAgreementのストリーミング試作、語時刻で切り捨て)を追加。詳細は PORTING.md 末尾。
+English: Added `rs-whisper-ts` (word-time check) and `rs-whisper-la` (LocalAgreement streaming prototype trimming by word times). See the end of PORTING.md.

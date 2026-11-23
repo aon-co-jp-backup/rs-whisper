@@ -129,3 +129,7 @@ whisper.cpp(MIT)を、段階ごとに C++ の出力と突き合わせながら R
 - مستندات به ۱۲ زبان است و باید بگوید ترجمهٔ هوش مصنوعی است و هنوز گویشور بومی بازبینی نکرده است.
 
 </div>
+
+## 2026-11-23 rs-whisper-la / word times
+日本語: `rs-whisper-ts`(語時刻の確認)と `rs-whisper-la`(LocalAgreementのストリーミング試作、語時刻で切り捨て)を追加。詳細は PORTING.md 末尾。
+English: Added `rs-whisper-ts` (word-time check) and `rs-whisper-la` (LocalAgreement streaming prototype trimming by word times). See the end of PORTING.md.
